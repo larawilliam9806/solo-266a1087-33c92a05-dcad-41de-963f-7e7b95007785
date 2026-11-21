@@ -37,6 +37,23 @@
       </table>
     {% endif %}
   </div>
+
+  <div class="card">
+    <h2>换交清册与发卷 CSV</h2>
+    <p class="muted">清册列：<code>卡号, 考场</code>；发卷列：<code>考场, 已登记卷式, 份数</code>。
+      两表一起整体替换：每张卡只登记一次，份数为正整数，同场同卷式只填一行，各场发卷总数须等于清册卡数。</p>
+    <form method="post" action="{{ url_for('upload_recon') }}" enctype="multipart/form-data">
+      <label>清册 CSV <input type="file" name="roster" accept=".csv,text/csv" required></label>
+      <label>发卷 CSV <input type="file" name="dist" accept=".csv,text/csv" required></label>
+      <button type="submit">换交并对账重算</button>
+    </form>
+    {% if recon_status %}
+      <p class="muted small">已提交：{{ recon_status.rooms }} 个考场 / {{ recon_status.cards }} 张清册卡。
+        仅对账通过考场的清册卡纳入统计。</p>
+    {% else %}
+      <p class="muted small">未提交发卷资料，当前按原方式统计（全部已登记卷式参与相容判定）。</p>
+    {% endif %}
+  </div>
 </section>
 
 {% if forms %}
@@ -66,6 +83,8 @@
   {% include "_stats_table.html" %}
 </section>
 
+{% include "_recon.html" %}
+
 {% if run.unmatched %}
 <section class="card">
   <h2>无可相容卷式的卡 <span class="badge">{{ run.unmatched|length }}</span></h2>
@@ -85,6 +104,11 @@
 <p class="muted small">
   共 {{ run.summary.cards_total }} 卡：{{ run.summary.cards_matched }} 卡有相容卷式，
   {{ run.summary.cards_unmatched }} 卡单列；{{ run.summary.questions }} 道标准题，{{ run.summary.flagged_cells }} 处待核。
+  {% if run.summary.recon %}
+    发卷对账已启用：{{ run.summary.recon.rooms_ok }} 场通过 / {{ run.summary.recon.rooms_failed }} 场对不上，
+    缺扫 {{ run.summary.recon.missing }} 卡，清册外 {{ run.summary.recon.off_roster }} 卡，
+    共 {{ run.summary.cards_excluded }} 张已扫卡未纳入统计。
+  {% endif %}
 </p>
 {% endif %}
 {% endif %}

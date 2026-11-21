@@ -90,6 +90,47 @@ CREATE TABLE IF NOT EXISTS run_unmatched (
     PRIMARY KEY (run_id, card_no)
 );
 
+-- 清册：每张卡登记一次，归属一个考场。
+CREATE TABLE IF NOT EXISTS roster_rows (
+    card_no TEXT PRIMARY KEY,
+    room    TEXT NOT NULL
+);
+
+-- 发卷：每个考场每种已登记卷式的实发份数。
+CREATE TABLE IF NOT EXISTS dist_rows (
+    room      TEXT NOT NULL,
+    form_name TEXT NOT NULL,
+    copies    INTEGER NOT NULL,
+    PRIMARY KEY (room, form_name)
+);
+
+-- 每个统计快照的对账结果（按考场）。
+CREATE TABLE IF NOT EXISTS run_rooms (
+    run_id     INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    room       TEXT NOT NULL,
+    ok         INTEGER NOT NULL DEFAULT 0,
+    roster     INTEGER NOT NULL DEFAULT 0,
+    scanned    INTEGER NOT NULL DEFAULT 0,
+    assignable INTEGER NOT NULL DEFAULT 0,
+    detail     TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, room)
+);
+
+-- 缺扫卡（清册有、无扫描结果）。
+CREATE TABLE IF NOT EXISTS run_missing (
+    run_id  INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    card_no TEXT NOT NULL,
+    room    TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, card_no)
+);
+
+-- 清册外的已扫卡。
+CREATE TABLE IF NOT EXISTS run_offroster (
+    run_id  INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    card_no TEXT NOT NULL,
+    PRIMARY KEY (run_id, card_no)
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT NOT NULL,

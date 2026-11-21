@@ -1,10 +1,11 @@
 """Form/answer parsing and the item-analysis engine.
 
-The engine is deliberately pure: it takes the current forms, answer rows and
-human review decisions, and returns a complete, deterministic snapshot.  The
-caller persists that snapshot in one transaction together with the change that
-triggered it, so forms, mapping corrections, review decisions and statistics
-always become visible at the same moment.
+The engine is deliberately pure: it takes the current forms, answer rows,
+human review decisions and the optional roster/distribution tables, and
+returns a complete, deterministic snapshot.  The caller persists that
+snapshot in one transaction together with the change that triggered it, so
+forms, mapping corrections, review decisions, reconciliation data and
+statistics always become visible at the same moment.
 """
 from __future__ import annotations
 
@@ -33,6 +34,15 @@ ANSWER_HEADERS = {
     "q_no": {"题号", "卷式题号", "印刷题号", "q_no", "qno", "question"},
     "letter": {"涂选字母", "选项字母", "字母", "letter", "option", "作答"},
     "scanned_code": {"实扫题码", "扫描题码", "实扫题号", "scanned_code", "scan_code", "scanned"},
+}
+ROSTER_HEADERS = {
+    "card_no": {"卡号", "答题卡号", "卡编号", "card_no", "card", "card_id"},
+    "room": {"考场", "考场号", "试室", "试室号", "room", "exam_room", "room_no"},
+}
+DIST_HEADERS = {
+    "room": {"考场", "考场号", "试室", "试室号", "room", "exam_room", "room_no"},
+    "form_name": {"已登记卷式", "卷式", "卷式名称", "卷型", "form", "form_name", "form_type"},
+    "copies": {"份数", "数量", "份", "copies", "count", "num"},
 }
 
 
@@ -148,6 +158,63 @@ def parse_answer_csv(raw: bytes):
     return out
 
 
+def parse_roster_csv(raw: bytes):
+    """清册 CSV -> [(card_no, room), ...]. 每张卡只能登记一次。"""
+    rows, _ = _read_rows(raw, ROSTER_HEADERS, "清册 CSV")
+    if not rows:
+        raise ValidationError("清册 CSV 没有数据行")
+    seen: dict[str, str] = {}
+    out = []
+    for card_no, room in rows:
+        if not card_no or not room:
+            raise ValidationError("清册行缺少卡号或考场")
+        if card_no in seen:
+            raise ValidationError(
+                f"卡号 {card_no} 在清册中登记多次（{seen[card_no]} / {room}）"
+            )
+        seen[card_no] = room
+        out.append((card_no, room))
+    return out
+
+
+def parse_dist_csv(raw: bytes):
+    """发卷 CSV -> [(room, form_name, copies), ...]. 份数为正整数，同场同卷式一行。"""
+    rows, _ = _read_rows(raw, DIST_HEADERS, "发卷 CSV")
+    if not rows:
+        raise ValidationError("发卷 CSV 没有数据行")
+    seen = set()
+    out = []
+    for room, form_name, copies in rows:
+        if not room or not form_name:
+            raise ValidationError("发卷行缺少考场或已登记卷式")
+        if not re.fullmatch(r"\d+", copies) or int(copies) < 1:
+            raise ValidationError(
+                f"考场 {room} 卷式「{form_name}」的份数须为正整数：{copies or '空'}"
+            )
+        if (room, form_name) in seen:
+            raise ValidationError(f"考场 {room} 的卷式「{form_name}」重复登记，请合并为一行")
+        seen.add((room, form_name))
+        out.append((room, form_name, int(copies)))
+    return out
+
+
+def validate_recon(roster_rows, dist_rows):
+    """Cross-check the two tables: 各场发卷总数须等于清册卡数。"""
+    roster_count: dict[str, int] = {}
+    for _, room in roster_rows:
+        roster_count[room] = roster_count.get(room, 0) + 1
+    dist_sum: dict[str, int] = {}
+    for room, _, copies in dist_rows:
+        dist_sum[room] = dist_sum.get(room, 0) + copies
+    for room in sorted(set(roster_count) | set(dist_sum)):
+        r = roster_count.get(room, 0)
+        d = dist_sum.get(room, 0)
+        if r != d:
+            raise ValidationError(
+                f"考场 {room} 发卷总数 {d} 与清册卡数 {r} 不一致"
+            )
+
+
 # --------------------------------------------------------------------------
 # Matching
 # --------------------------------------------------------------------------
@@ -198,23 +265,133 @@ class Analysis:
         self.flagged: list[dict] = []
         self.cards_total = 0
         self.cards_matched = 0
+        self.cards_excluded = 0      # 对账模式：清册外或对不上考场的已扫卡
+        self.recon: "ReconResult | None" = None
 
     def summary(self) -> dict:
-        return {
+        s = {
             "cards_total": self.cards_total,
             "cards_matched": self.cards_matched,
             "cards_unmatched": len(self.unmatched_cards),
             "questions": len(self.question_codes),
             "flagged_cells": len(self.flagged),
         }
+        if self.recon is not None:
+            s["cards_excluded"] = self.cards_excluded
+            s["recon"] = {
+                "rooms_ok": sum(1 for r in self.recon.rooms if r["ok"]),
+                "rooms_failed": sum(1 for r in self.recon.rooms if not r["ok"]),
+                "missing": len(self.recon.missing),
+                "off_roster": len(self.recon.off_roster),
+            }
+        return s
 
 
-def analyse(forms, card_rows_by_card: dict, decisions: dict) -> Analysis:
+# --------------------------------------------------------------------------
+# 发卷对账：已扫卡与实发卷式名额的匹配
+# --------------------------------------------------------------------------
+
+class ReconResult:
+    def __init__(self):
+        self.rooms: list[dict] = []            # 按考场排列的对账结果
+        self.rooms_by_name: dict[str, dict] = {}
+        self.missing: list[dict] = []          # 缺扫卡 {card_no, room}
+        self.off_roster: list[str] = []        # 清册外的已扫卡
+        self.compat_by_card: dict[str, list] = {}  # 已扫清册卡 -> 相容的实发卷式名
+
+
+def _max_assignable(cards, compat, caps) -> int:
+    """二分匹配：每张卡占一个相容卷式名额，每种卷式有 caps[form] 个名额。
+
+    返回最多能分入名额的卡数。对账只判断可行性，具体分配不作结论。
+    """
+    slot_form: list[str] = []
+    for name in sorted(caps):
+        slot_form.extend([name] * caps[name])
+    slots_of_form: dict[str, list[int]] = {}
+    for idx, name in enumerate(slot_form):
+        slots_of_form.setdefault(name, []).append(idx)
+    card_slots = {
+        c: [i for name in compat.get(c, ()) for i in slots_of_form.get(name, ())]
+        for c in cards
+    }
+    match: dict[int, str] = {}  # slot -> card
+
+    def augment(card, seen) -> bool:
+        for si in card_slots[card]:
+            if si in seen:
+                continue
+            seen.add(si)
+            if si not in match or augment(match[si], seen):
+                match[si] = card
+                return True
+        return False
+
+    assigned = 0
+    for card in sorted(card_slots):
+        if augment(card, set()):
+            assigned += 1
+    return assigned
+
+
+def reconcile(forms, card_rows_by_card, roster, dist) -> ReconResult:
+    """把一个考场的已扫卡分到该场实发卷式的名额里。
+
+    roster: {card_no: room}; dist: {room: {form_name: copies}}。
+    考场通过的条件：每张已扫卡都能分到一个相容的实发卷式，且每种卷式
+    分入的卡数不超过实发份数（缺扫卡占用剩余名额，所以名额总数够用）。
+    """
+    forms_by_name = {f["name"]: f for f in forms.values()}
+    res = ReconResult()
+    roster_by_room: dict[str, list] = {}
+    for card_no, room in roster.items():
+        roster_by_room.setdefault(room, []).append(card_no)
+
+    for room in sorted(set(roster_by_room) | set(dist), key=_natural_key):
+        cards = sorted(roster_by_room.get(room, []), key=_natural_key)
+        caps = dist.get(room, {})
+        scanned = [c for c in cards if c in card_rows_by_card]
+        missing = [c for c in cards if c not in card_rows_by_card]
+        compat = {}
+        for c in scanned:
+            ok_forms = [
+                name for name in caps
+                if name in forms_by_name
+                and form_is_compatible(forms_by_name[name], card_rows_by_card[c])
+            ]
+            compat[c] = ok_forms
+            res.compat_by_card[c] = ok_forms
+        assignable = _max_assignable(scanned, compat, caps)
+        unknown = [n for n in caps if n not in forms_by_name]
+        ok = assignable == len(scanned)
+        notes = []
+        if not ok:
+            notes.append(f"已扫 {len(scanned)} 卡，最多 {assignable} 卡可分入名额")
+        if unknown:
+            notes.append("卷式未登记：" + "、".join(unknown))
+        info = {
+            "room": room, "roster": len(cards), "scanned": len(scanned),
+            "assignable": assignable, "ok": ok, "detail": "；".join(notes),
+            "forms": dict(caps),
+        }
+        res.rooms.append(info)
+        res.rooms_by_name[room] = info
+        res.missing.extend({"card_no": c, "room": room} for c in missing)
+    res.off_roster = sorted(
+        (c for c in card_rows_by_card if c not in roster), key=_natural_key
+    )
+    return res
+
+
+def analyse(forms, card_rows_by_card: dict, decisions: dict,
+            roster: dict | None = None, dist: dict | None = None) -> Analysis:
     """Compute the whole analysis snapshot.
 
     forms: OrderedDict from build_forms
     card_rows_by_card: {card_no: {q_no: {"letter":..., "scanned_code":...}}}
     decisions: {(card_no, std_code): {"resolution":..., "note":...}}
+    roster/dist: 清册 {card_no: room} 与发卷 {room: {form_name: copies}}；
+    为 None 时按原方式统计（全部已登记卷式参与相容判定）。
     """
     result = Analysis()
 
@@ -229,6 +406,9 @@ def analyse(forms, card_rows_by_card: dict, decisions: dict) -> Analysis:
     result.options = {c: sorted(options[c]) for c in result.question_codes}
 
     all_forms = list(forms.values())
+    forms_by_name = {f["name"]: f for f in all_forms}
+    if roster:
+        result.recon = reconcile(forms, card_rows_by_card, roster, dist or {})
     for code in result.question_codes:
         result.stats[code] = {
             "counted": 0, "blank": 0, "flagged": 0,
@@ -238,7 +418,20 @@ def analyse(forms, card_rows_by_card: dict, decisions: dict) -> Analysis:
     result.cards_total = len(card_rows_by_card)
     for card_no in sorted(card_rows_by_card):
         rows = card_rows_by_card[card_no]
-        compatible = [f for f in all_forms if form_is_compatible(f, rows)]
+        if result.recon is not None:
+            # 对账模式：清册外的卡、对不上考场的卡都不纳入题项统计；
+            # 通过的考场只拿该场实发卷式做相容判定（对账时的名额分配
+            # 只验证可行性，不作为单卡卷式结论）。
+            room = roster.get(card_no)
+            if room is None or not result.recon.rooms_by_name[room]["ok"]:
+                result.cards_excluded += 1
+                continue
+            compatible = [
+                forms_by_name[name]
+                for name in result.recon.compat_by_card.get(card_no, ())
+            ]
+        else:
+            compatible = [f for f in all_forms if form_is_compatible(f, rows)]
         if not compatible:
             detail = "无可相容卷式（整卡题号不一致或非空题码/涂选字母不吻合）"
             result.unmatched_cards.append({"card_no": card_no, "detail": detail})
@@ -372,8 +565,29 @@ def load_decisions(conn):
     }
 
 
+def load_roster(conn):
+    return {
+        r["card_no"]: r["room"]
+        for r in conn.execute("SELECT card_no, room FROM roster_rows")
+    }
+
+
+def load_dist(conn):
+    dist: dict[str, dict] = {}
+    for r in conn.execute(
+        "SELECT room, form_name, copies FROM dist_rows ORDER BY room, form_name"
+    ):
+        dist.setdefault(r["room"], {})[r["form_name"]] = r["copies"]
+    return dist
+
+
 def compute(conn) -> Analysis:
-    return analyse(load_forms(conn), load_card_rows(conn), load_decisions(conn))
+    roster = load_roster(conn)
+    # 未提交发卷资料时沿用原统计方式。
+    return analyse(
+        load_forms(conn), load_card_rows(conn), load_decisions(conn),
+        roster=roster or None, dist=load_dist(conn) if roster else None,
+    )
 
 
 def persist_run(conn, analysis: Analysis, created_at: str) -> int:
@@ -408,6 +622,21 @@ def persist_run(conn, analysis: Analysis, created_at: str) -> int:
         "INSERT INTO run_unmatched(run_id, card_no, detail) VALUES (?, ?, ?)",
         [(run_id, u["card_no"], u["detail"]) for u in analysis.unmatched_cards],
     )
+    if analysis.recon is not None:
+        conn.executemany(
+            "INSERT INTO run_rooms(run_id, room, ok, roster, scanned, assignable, detail) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(run_id, r["room"], 1 if r["ok"] else 0, r["roster"], r["scanned"],
+              r["assignable"], r["detail"]) for r in analysis.recon.rooms],
+        )
+        conn.executemany(
+            "INSERT INTO run_missing(run_id, card_no, room) VALUES (?, ?, ?)",
+            [(run_id, m["card_no"], m["room"]) for m in analysis.recon.missing],
+        )
+        conn.executemany(
+            "INSERT INTO run_offroster(run_id, card_no) VALUES (?, ?)",
+            [(run_id, c) for c in analysis.recon.off_roster],
+        )
     return run_id
 
 

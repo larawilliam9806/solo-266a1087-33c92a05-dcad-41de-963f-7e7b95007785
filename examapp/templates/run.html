@@ -18,6 +18,8 @@
   {% include "_stats_table.html" %}
 </section>
 
+{% include "_recon.html" %}
+
 <section class="card">
   <h2 id="flagged-heading">待核题格 <span class="badge">{{ run.flagged|length }}</span></h2>
   {% if run.flagged %}

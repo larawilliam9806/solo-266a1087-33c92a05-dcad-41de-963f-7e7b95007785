@@ -49,6 +49,7 @@ main { max-width: 1180px; margin: 0 auto; padding: 24px; }
 
 h1, h2 { margin: 0 0 10px; font-size: 18px; }
 h2 .small { font-weight: 400; margin-left: 8px; }
+h3 { font-size: 15px; margin: 14px 0 6px; }
 
 .grid {
   display: grid;
@@ -91,6 +92,9 @@ h2 .small { font-weight: 400; margin-left: 8px; }
 .badge.current { background: #e7f0ff; color: var(--accent); }
 
 form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+form label { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+
+.cardlist { display: flex; flex-wrap: wrap; gap: 6px; }
 
 input[type=text], input[type=file], select {
   padding: 7px 10px;

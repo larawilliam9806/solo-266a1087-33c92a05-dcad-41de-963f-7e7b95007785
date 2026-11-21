@@ -193,6 +193,8 @@ def _apply_mutation(conn, kind: str, payload: dict) -> int:
             _do_upload_answers(conn, payload)
         elif kind == "upload_form":
             _do_upload_form(conn, payload)
+        elif kind == "upload_recon":
+            _do_upload_recon(conn, payload)
         elif kind == "correct_code":
             _do_correct_code(conn, payload)
         elif kind == "set_decision":
@@ -224,6 +226,21 @@ def _do_upload_answers(conn, payload):
         "INSERT INTO answer_rows(card_no, q_no, letter, scanned_code) "
         "VALUES (?, ?, ?, ?)",
         [(r["card_no"], r["q_no"], r["letter"], r["scanned_code"]) for r in rows],
+    )
+
+
+def _do_upload_recon(conn, payload):
+    """换交清册与发卷两表：校验通过后整体替换，随后一起重算对账与统计。"""
+    roster = engine.parse_roster_csv(payload["roster_csv"].encode("utf-8"))
+    dist = engine.parse_dist_csv(payload["dist_csv"].encode("utf-8"))
+    engine.validate_recon(roster, dist)
+    conn.execute("DELETE FROM roster_rows")
+    conn.executemany(
+        "INSERT INTO roster_rows(card_no, room) VALUES (?, ?)", roster
+    )
+    conn.execute("DELETE FROM dist_rows")
+    conn.executemany(
+        "INSERT INTO dist_rows(room, form_name, copies) VALUES (?, ?, ?)", dist
     )
 
 
@@ -361,10 +378,41 @@ def read_run(conn, run_id: int) -> dict | None:
         )
     ]
 
+    summary = json.loads(run["summary_json"] or "{}")
+    recon = None
+    if summary.get("recon") is not None:
+        rooms = [
+            {**dict(r), "ok": bool(r["ok"])}
+            for r in conn.execute(
+                "SELECT room, ok, roster, scanned, assignable, detail "
+                "FROM run_rooms WHERE run_id = ?",
+                (run_id,),
+            )
+        ]
+        rooms.sort(key=lambda r: engine._natural_key(r["room"]))
+        recon = {
+            "rooms": rooms,
+            "missing": [
+                dict(r) for r in conn.execute(
+                    "SELECT card_no, room FROM run_missing "
+                    "WHERE run_id = ? ORDER BY card_no",
+                    (run_id,),
+                )
+            ],
+            "off_roster": [
+                r["card_no"] for r in conn.execute(
+                    "SELECT card_no FROM run_offroster "
+                    "WHERE run_id = ? ORDER BY card_no",
+                    (run_id,),
+                )
+            ],
+        }
+
     return {
         "id": run["id"],
         "created_at": run["created_at"],
-        "summary": json.loads(run["summary_json"] or "{}"),
+        "summary": summary,
+        "recon": recon,
         "stats": {code: stats[code] for code in sorted(stats, key=engine._natural_key)},
         "cards": cards,
         "flagged": flagged,
@@ -393,7 +441,8 @@ def job_view(job) -> dict | None:
     if job is None:
         return None
     payload = json.loads(job["payload"])
-    payload.pop("csv", None)  # never ship raw CSV to the browser
+    for key in ("csv", "roster_csv", "dist_csv"):
+        payload.pop(key, None)  # never ship raw CSV to the browser
     return {
         "id": job["id"], "kind": job["kind"], "status": job["status"],
         "error": job["error"], "created_at": job["created_at"],
@@ -442,8 +491,20 @@ def register_routes(app: Flask):
         card_count = conn.execute(
             "SELECT COUNT(DISTINCT card_no) AS n FROM answer_rows"
         ).fetchone()["n"]
+        recon_cards = conn.execute(
+            "SELECT COUNT(*) AS n FROM roster_rows"
+        ).fetchone()["n"]
+        recon_status = None
+        if recon_cards:
+            recon_status = {
+                "cards": recon_cards,
+                "rooms": conn.execute(
+                    "SELECT COUNT(DISTINCT room) AS n FROM dist_rows"
+                ).fetchone()["n"],
+            }
         return render_template(
             "index.html", run=view, runs=runs, forms=forms, card_count=card_count,
+            recon_status=recon_status,
             job=job_view(latest_job(conn)), recomputing=is_recomputing(conn),
             error=request.args.get("error"), message=request.args.get("message"),
         )
@@ -529,6 +590,30 @@ def register_routes(app: Flask):
             return _back("请填写卷式、题号和新的标准题码")
         app.worker.submit("correct_code", payload)
         return _back(None, f"题号 {payload['q_no']} 的题码订正已受理，正在重算")
+
+    @app.post("/recon")
+    def upload_recon():
+        roster_file = request.files.get("roster")
+        dist_file = request.files.get("dist")
+        if (roster_file is None or not roster_file.filename
+                or dist_file is None or not dist_file.filename):
+            return _back("请同时选择清册 CSV 和发卷 CSV，两表一起换交")
+        raw_roster = roster_file.read()
+        raw_dist = dist_file.read()
+        try:
+            roster = engine.parse_roster_csv(raw_roster)
+            dist = engine.parse_dist_csv(raw_dist)
+            engine.validate_recon(roster, dist)
+        except engine.ValidationError as exc:
+            return _back(str(exc))
+        app.worker.submit("upload_recon", {
+            "roster_csv": engine.decode_csv(raw_roster),
+            "dist_csv": engine.decode_csv(raw_dist),
+        })
+        return _back(
+            None,
+            f"清册 {len(roster)} 卡、发卷 {len(dist)} 行已受理，正在对账并重算",
+        )
 
     @app.post("/review")
     def review():

@@ -531,3 +531,314 @@ def test_queued_job_replayed_after_restart(app):
         time.sleep(0.05)
     assert result is not None
     assert result["stats"]["Q1"]["counted"] == 1
+
+
+# --------------------------------------------------------------------------
+# 发卷对账
+# --------------------------------------------------------------------------
+
+ROSTER_HEADER = "卡号,考场\n"
+DIST_HEADER = "考场,已登记卷式,份数\n"
+
+
+def roster_csv(rows):
+    return ROSTER_HEADER + "".join(f"{card},{room}\n" for card, room in rows)
+
+
+def dist_csv(rows):
+    return DIST_HEADER + "".join(f"{room},{form},{n}\n" for room, form, n in rows)
+
+
+def upload_recon(client, roster_text, dist_text):
+    data = {
+        "roster": (io.BytesIO(roster_text.encode("utf-8")), "roster.csv"),
+        "dist": (io.BytesIO(dist_text.encode("utf-8")), "dist.csv"),
+    }
+    response = client.post(
+        "/recon", data=data, content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    return response
+
+
+def recon_of(run):
+    return run["recon"]
+
+
+def test_roster_rejects_duplicate_card():
+    with pytest.raises(engine.ValidationError):
+        engine.parse_roster_csv(roster_csv([("C1", "R1"), ("C1", "R2")]).encode())
+
+
+def test_dist_requires_positive_integer_copies():
+    for bad in ("0", "-1", "2.5", "abc", ""):
+        with pytest.raises(engine.ValidationError):
+            engine.parse_dist_csv(
+                (DIST_HEADER + f"R1,A卷,{bad}\n").encode()
+            )
+    assert engine.parse_dist_csv(dist_csv([("R1", "A卷", "3")]).encode()) == [
+        ("R1", "A卷", 3)
+    ]
+
+
+def test_dist_rejects_duplicate_room_form():
+    with pytest.raises(engine.ValidationError):
+        engine.parse_dist_csv(
+            dist_csv([("R1", "A卷", "1"), ("R1", "A卷", "2")]).encode()
+        )
+
+
+def test_recon_csv_column_names_are_flexible():
+    assert engine.parse_roster_csv("card,room\nC1,R1\n".encode()) == [("C1", "R1")]
+    assert engine.parse_dist_csv("room,form,copies\nR1,A卷,3\n".encode()) == [
+        ("R1", "A卷", 3)
+    ]
+
+
+def test_dist_sum_must_equal_roster_count(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+    ]))
+    before = stats_of(current_run(app))
+    # 发卷总数 2 ≠ 清册卡数 1；另一个考场只在发卷表出现。
+    resp = upload_recon(
+        client,
+        roster_csv([("C1", "R1")]),
+        dist_csv([("R1", "A卷", "2"), ("R2", "A卷", "1")]),
+    )
+    assert "不一致" in resp.get_data(as_text=True)
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        n = conn.execute("SELECT COUNT(*) AS n FROM roster_rows").fetchone()["n"]
+        conn.close()
+    assert n == 0
+    assert stats_of(current_run(app)) == before
+    assert current_run(app)["recon"] is None
+
+
+def test_recon_room_must_fit_scanned_cards(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+        # C2 与 A卷不相容（实扫题码 Q9），占不到任何名额
+        ("C2", "1", "A", "Q9"), ("C2", "2", "B", "Q2"),
+    ]))
+    upload_recon(
+        client,
+        roster_csv([("C1", "R1"), ("C2", "R1")]),
+        dist_csv([("R1", "A卷", "2")]),
+    )
+    run = current_run(app)
+    room = recon_of(run)["rooms"][0]
+    assert room["ok"] is False
+    assert room["scanned"] == 2          # 已扫卡数
+    assert room["assignable"] == 1       # 最多能分入名额的卡数
+    # 对不上的考场整场不纳入统计
+    assert all(s["counted"] == 0 for s in stats_of(run).values())
+    assert run["summary"]["cards_excluded"] == 2
+    assert run["unmatched"] == []
+
+
+def test_recon_capacity_contention_fails_room(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+        ("C2", "1", "B", "Q1"), ("C2", "2", "A", "Q2"),
+    ]))
+    # 两张卡都只相容 A卷，但 A卷只发了 1 份
+    upload_recon(
+        client,
+        roster_csv([("C1", "R1"), ("C2", "R1")]),
+        dist_csv([("R1", "A卷", "1"), ("R1", "B卷", "1")]),
+    )
+    room = recon_of(current_run(app))["rooms"][0]
+    assert room["ok"] is False
+    assert room["scanned"] == 2
+    assert room["assignable"] == 1
+
+
+def test_passing_room_uses_only_distributed_forms(client, app):
+    divergent_b = form_csv([
+        ("1", "A", "Q1", "B"), ("1", "B", "Q1", "A"),
+        ("2", "A", "Q2", "A"), ("2", "B", "Q2", "B"),
+    ])
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/forms", divergent_b, name="B卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "A", "Q2"),
+    ]))
+    # 无对账：A/B 两卷都相容，Q1 归一分歧 -> 待核
+    assert stats_of(current_run(app))["Q1"]["flagged"] == 1
+    # 该场只发了 A卷：只按 A卷判定 -> Q1 计入 A
+    upload_recon(
+        client, roster_csv([("C1", "R1")]), dist_csv([("R1", "A卷", "1")])
+    )
+    stats = stats_of(current_run(app))
+    assert stats["Q1"] == {"counted": 1, "blank": 0, "flagged": 0,
+                           "options": {"A": 1, "B": 0}}
+
+
+def test_assignment_is_not_a_per_card_form_conclusion(client, app):
+    divergent_b = form_csv([
+        ("1", "A", "Q1", "B"), ("1", "B", "Q1", "A"),
+        ("2", "A", "Q2", "A"), ("2", "B", "Q2", "B"),
+    ])
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/forms", divergent_b, name="B卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "A", "Q2"),
+    ]))
+    # 名额足够（C2 缺扫占剩余名额），考场通过；但 C1 仍相容两种卷式，
+    # 对账分配不得把它定死到某一卷 -> Q1 仍按原规则判分歧。
+    upload_recon(
+        client,
+        roster_csv([("C1", "R1"), ("C2", "R1")]),
+        dist_csv([("R1", "A卷", "1"), ("R1", "B卷", "1")]),
+    )
+    run = current_run(app)
+    assert recon_of(run)["rooms"][0]["ok"] is True
+    assert stats_of(run)["Q1"]["flagged"] == 1
+    assert stats_of(run)["Q2"]["counted"] == 1
+    assert [m["card_no"] for m in recon_of(run)["missing"]] == ["C2"]
+
+
+def test_off_roster_cards_are_not_counted(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+        ("C9", "1", "A", "Q1"), ("C9", "2", "B", "Q2"),
+    ]))
+    upload_recon(
+        client, roster_csv([("C1", "R1")]), dist_csv([("R1", "A卷", "1")])
+    )
+    run = current_run(app)
+    assert recon_of(run)["off_roster"] == ["C9"]
+    assert stats_of(run)["Q1"]["counted"] == 1   # 只计 C1
+    assert run["summary"]["cards_excluded"] == 1
+
+
+def test_missing_scan_cards_are_listed(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+    ]))
+    upload_recon(
+        client,
+        roster_csv([("C1", "R1"), ("C2", "R1"), ("C3", "R1")]),
+        dist_csv([("R1", "A卷", "3")]),
+    )
+    run = current_run(app)
+    assert recon_of(run)["rooms"][0]["ok"] is True
+    assert [m["card_no"] for m in recon_of(run)["missing"]] == ["C2", "C3"]
+    assert stats_of(run)["Q1"]["counted"] == 1
+
+
+def test_recon_recomputed_when_answers_change(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload_recon(
+        client, roster_csv([("C1", "R1")]), dist_csv([("R1", "A卷", "1")])
+    )
+    room = recon_of(current_run(app))["rooms"][0]
+    assert room["scanned"] == 0 and room["ok"] is True
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+    ]))
+    run = current_run(app)
+    assert recon_of(run)["rooms"][0]["scanned"] == 1
+    assert stats_of(run)["Q1"]["counted"] == 1
+
+
+def test_recon_recomputed_when_form_changes(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+    ]))
+    upload_recon(
+        client, roster_csv([("C1", "R1")]), dist_csv([("R1", "A卷", "1")])
+    )
+    assert recon_of(current_run(app))["rooms"][0]["ok"] is True
+    # 替换 A卷使实扫题码不再吻合 -> 考场对不上，统计撤下
+    replacement = form_csv([
+        ("1", "A", "X1", "A"), ("1", "B", "X1", "B"),
+        ("2", "A", "X2", "A"), ("2", "B", "X2", "B"),
+    ])
+    upload(client, "/forms", replacement, name="A卷")
+    run = current_run(app)
+    assert recon_of(run)["rooms"][0]["ok"] is False
+    assert all(s["counted"] == 0 for s in stats_of(run).values())
+
+
+def test_failed_recon_upload_keeps_previous_state(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+    ]))
+    upload_recon(
+        client, roster_csv([("C1", "R1")]), dist_csv([("R1", "A卷", "1")])
+    )
+    before = stats_of(current_run(app))
+    # 校验失败：份数不是正整数 -> 原清册/发卷与统计都不变
+    resp = upload_recon(
+        client, roster_csv([("C1", "R1")]), dist_csv([("R1", "A卷", "0")])
+    )
+    assert "正整数" in resp.get_data(as_text=True)
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        rows = conn.execute("SELECT card_no FROM roster_rows").fetchall()
+        conn.close()
+    assert [r["card_no"] for r in rows] == ["C1"]
+    assert stats_of(current_run(app)) == before
+
+
+def test_failed_recon_job_rolls_back(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+    ]))
+    upload_recon(
+        client, roster_csv([("C1", "R1")]), dist_csv([("R1", "A卷", "1")])
+    )
+    before = stats_of(current_run(app))
+
+    from examapp import app as app_module
+    original = app_module._do_upload_recon
+
+    def boom(conn, payload):
+        original(conn, payload)
+        raise RuntimeError("disk full")
+
+    app_module._do_upload_recon = boom
+    try:
+        resp = upload_recon(
+            client,
+            roster_csv([("C1", "R1"), ("C2", "R1")]),
+            dist_csv([("R1", "A卷", "2")]),
+        )
+        assert "失败" in resp.get_data(as_text=True)
+    finally:
+        app_module._do_upload_recon = original
+
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        rows = conn.execute("SELECT card_no FROM roster_rows").fetchall()
+        conn.close()
+    assert [r["card_no"] for r in rows] == ["C1"]
+    assert stats_of(current_run(app)) == before
+
+
+def test_recon_section_shown_on_pages(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+    ]))
+    assert "发卷对账" not in client.get("/").get_data(as_text=True)
+    upload_recon(
+        client, roster_csv([("C1", "R1")]), dist_csv([("R1", "A卷", "1")])
+    )
+    page = client.get("/").get_data(as_text=True)
+    assert "发卷对账" in page and "通过" in page
+    run_id = current_run(app)["id"]
+    page = client.get(f"/runs/{run_id}").get_data(as_text=True)
+    assert "发卷对账" in page

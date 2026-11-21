@@ -1,0 +1,62 @@
+{% if run.recon %}
+<section class="card">
+  <h2>发卷对账 <span class="muted small">快照 #{{ run.id }}</span></h2>
+  <p class="muted small">
+    只有对账通过考场的清册卡才纳入题项统计，且只按该场实发卷式判定作答；
+    对账时的名额分配不作为单卡卷式结论。缺扫卡占用剩余名额，清册外的卡不计入。
+  </p>
+  <div class="table-wrap">
+  <table class="compact">
+    <thead>
+      <tr><th>考场</th><th>清册卡数</th><th>已扫卡数</th><th>最多可分入</th><th>结果</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+    {% for r in run.recon.rooms %}
+      <tr>
+        <td>{{ r.room }}</td>
+        <td>{{ r.roster }}</td>
+        <td>{{ r.scanned }}</td>
+        <td>{{ r.assignable }}</td>
+        <td>
+          {% if r.ok %}<span class="tag ok">通过</span>
+          {% else %}<span class="tag danger">对不上</span>{% endif %}
+        </td>
+        <td class="muted">{{ r.detail }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <div class="grid">
+    <div>
+      <h3>缺扫卡号 <span class="badge">{{ run.recon.missing|length }}</span></h3>
+      {% if run.recon.missing %}
+        <p class="muted small">清册登记但未扫到的卡（占用所属考场剩余名额）：</p>
+        <div class="table-wrap">
+        <table class="compact">
+          <thead><tr><th>卡号</th><th>考场</th></tr></thead>
+          <tbody>
+          {% for m in run.recon.missing %}
+            <tr><td>{{ m.card_no }}</td><td class="muted">{{ m.room }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      {% else %}
+        <p class="muted small">清册卡全部已扫。</p>
+      {% endif %}
+    </div>
+    <div>
+      <h3>清册外卡号 <span class="badge">{{ run.recon.off_roster|length }}</span></h3>
+      {% if run.recon.off_roster %}
+        <p class="muted small">已扫但未在清册登记的卡，不计入统计：</p>
+        <p class="cardlist">
+        {% for c in run.recon.off_roster %}<span class="tag">{{ c }}</span>{% endfor %}
+        </p>
+      {% else %}
+        <p class="muted small">没有清册外的已扫卡。</p>
+      {% endif %}
+    </div>
+  </div>
+</section>
+{% endif %}
